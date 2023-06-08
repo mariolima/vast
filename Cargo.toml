@@ -13,6 +13,7 @@ ntapi = "0.4.1"
 rust-embed = "6.6.1"
 base64 = "0.21.0"
 obfstr = "0.4.3"
+scanf = "1.2.1"
 
 
 [profile.dev]
@@ -21,3 +22,6 @@ lto = true          # Enable link-time optimization
 codegen-units = 1   # Reduce number of codegen units to increase optimizations
 panic = 'abort'     # Abort on panic
 strip = true        # Strip symbols from binary*
+
+[lib]
+crate-type = ["cdylib"]
